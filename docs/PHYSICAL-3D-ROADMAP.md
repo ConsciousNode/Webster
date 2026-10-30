@@ -26,3 +26,26 @@ Kham's ideas and the plan agreed on Oct 30 2026, starting from the v6 engine. No
    sibilant groove for /s/, the sublingual cavity for /ʃ/, and the piriform sinuses.
 
 First follow-ups on v6 itself: /s/ is too quiet, /u/ F2 is +15%, and it runs ~1.7× slower than real time.
+
+## Added later that night (Oct 30, ~1 am)
+
+10. **Cache the state, not the audio.** The mesh is a linear recurrent network with a constant-size state (~20 KB for
+    32 × 9 × 9). Snapshot it at phoneme boundaries; ROSA finds the longest rendered prefix and the snapshot resumes
+    it exactly. The planner looks ahead (anticipatory coarticulation is real speech, not a leak), so a snapshot
+    must sit before that look-ahead window ends. Same structure as the LEARNS R_B leak, opposite verdict: there
+    the future was cheating, here it's physics, but bounded. ROSA can chain into nested lookup tables: the context
+    it finds indexes the snapshot/atlas tables.
+11. **The DOOM principle: an envelope atlas.** Don't simulate the tract, reproduce its *effect*: measure the
+    spectral-envelope shapes (and the glides between sounds) from real speech, and play the glottal source
+    through them. AuraGraph's analysis is both the window and the builder: a tile's geometry (formant ridges as
+    curves, read on the labelled grid) is the shape the atlas stores. The fast path. Pairs with OmniVocal's 10
+    voice dimensions. Blend many speakers (Common Voice, Spoken Wikipedia) so voices stay *character, not identity*.
+12. **The atlas trains the mesh.** The same measured envelopes become the AdamW targets for the slow true path,
+    so the physics learns real voices instead of 1952 textbook formants.
+13. **Mesh as teacher.** This is already OmniVocal's stage 1 (a "Neural Webster" trained on Webster output):
+    Physical 3D is the teacher it can learn from.
+14. **Moving mouths from the Slice Suite.** The tract is a voxel map, so Slice of Life can sculpt shapes (an /l/
+    by hand), and SliceWorks' joints map onto articulators: a hinge for the jaw, a chain for the tongue, voxelised
+    into the mesh each frame.
+15. **A Jev-style picker.** A fast one-pass classifier that picks the atlas entry for each frame from its context,
+    instead of a search.
