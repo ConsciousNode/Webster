@@ -350,7 +350,8 @@
             <div style="display:flex;gap:10px;">
                 <button class="toggle-btn active" id="btn-formant" style="flex:1;" title="Klatt-style cascade formant synthesis (v4)">Formant</button>
                 <button class="toggle-btn" id="btn-retro" style="flex:1;" title="The original v3 formant engine">Retro</button>
-                <button class="toggle-btn" id="btn-dwm" style="flex:1;">Physical</button>
+                <button class="toggle-btn" id="btn-dwm" style="flex:1;">Physical 2D</button>
+                <button class="toggle-btn" id="btn-m3d" style="flex:1;">Physical 3D</button>
             </div>
         </div>
 
@@ -465,7 +466,8 @@
     <h3 style="margin-bottom:0.5rem;">Synthesis Engines</h3>
     <p style="color:var(--text-muted);margin-bottom:0.5rem;"><strong>Formant</strong> — Klatt-style synthesis (v4): a glottal pulse through a cascade of five resonators, noise through parallel bands for hiss and bursts, smooth transitions between sounds. The default.</p>
     <p style="color:var(--text-muted);margin-bottom:0.5rem;"><strong>Retro</strong> — the original v3 engine: a sawtooth through three band filters. Buzzier, very 1980s.</p>
-    <p style="color:var(--text-muted);margin-bottom:1rem;"><strong>Physical</strong> — a 2-D waveguide mesh of a 17.6 cm vocal tract: sound actually travels through a simulated tube shaped for each sound. Same voice and melody as Formant, a rounder, more resonant tract. Slower to render (about half real time). Front vowels like the "ee" in "see" come out a little lax. Experimental.</p>
+    <p style="color:var(--text-muted);margin-bottom:1rem;"><strong>Physical 2D</strong> — a 2-D waveguide mesh of a 17.6 cm vocal tract: sound actually travels through a simulated tube shaped for each sound. Same voice and melody as Formant, a rounder, more resonant tract. Slower to render (about half real time). Front vowels like the "ee" in "see" come out a little lax. Experimental.</p>
+    <p style="color:var(--text-muted);margin-bottom:1rem;"><strong>Physical 3D</strong> — the same idea in three dimensions: sound travels through a 17.8 cm tract made of voxels with real height and width. Slower than real time (about 1.7×), quieter s-sounds for now. Very experimental.</p>
   </div>
 </div>
 
@@ -2420,6 +2422,452 @@ class MeshSynth extends KlattSynth {
     render(phonemeSeq, config) { return mRender(phonemeSeq, config); }
 }
 
+// ==== WEBSTER MESH 3D CORE (v6) ====
+// Physical 3D: a volumetric FDTD mesh (32 × 9 × 9 voxels, 110,250 Hz). Written by ChatGPT ("Jeep") as a standalone
+// deliverable; integrated and verified in the app by Kehai Interim. Method and measurements: docs/PHYSICAL-3D.md.
+/*
+ * Webster Physical 3D — standalone engine core
+ * ConsciousNode SoftWorks / research prototype
+ *
+ * This file is intentionally dependency-injected. In Webster's single HTML file,
+ * call createWebsterMesh3D(...) after the existing v5.1 speech/mesh declarations.
+ * No imports, network access, WebGPU, WASM, or external libraries are required.
+ */
+(function (root, factory) {
+  const api = factory();
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  if (root) root.WebsterMesh3D = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  'use strict';
+
+  const C_CM_S = 34300;
+  const FS = 110250;                 // exactly 5 × Webster's 22,050 Hz output rate
+  const LAMBDA = 0.56;              // below the equal-cell 3-D CFL limit (1/√3 ≈ 0.57735)
+  const DX = C_CM_S / (FS * LAMBDA);
+  const NX = 32, NY = 9, NZ = 9;
+  const MULT = 5, OUT_SR = FS / MULT;
+  const FRAME_MS = 5;
+  const SIGMA = Math.PI * 42;        // continuous pressure-loss rate (s^-1)
+  const SIGMA_DT = SIGMA / FS;
+  const LAMBDA2 = LAMBDA * LAMBDA;
+  const NASAL_CELLS = 20;
+  const ASPECT = 1.25;               // lateral/vertical ellipse-axis ratio; explicit geometric assumption
+  const AREA_MIN = DX * DX;
+  const AREA_BASE = 3.0;
+
+  function assert(ok, message) { if (!ok) throw new Error(message); }
+  function idx(x, y, z, ny, nz) { return (x * ny + y) * nz + z; }
+
+  // Cell-centred elliptical cross-sections. Area is quantised to whole voxel faces;
+  // the returned record reports the realised area so tests/docs can expose that error.
+  function rasterEllipse(areaCm2, ny = NY, nz = NZ, dx = DX, aspect = ASPECT) {
+    const mask = new Uint8Array(ny * nz);
+    if (!(areaCm2 > 0)) return { mask, cells: 0, area: 0, error: areaCm2 };
+    const cy = (ny - 1) / 2, cz = (nz - 1) / 2;
+    const ry = Math.sqrt(areaCm2 / (Math.PI * aspect));
+    const rz = ry * aspect;
+    const candidates = [];
+    for (let y = 0; y < ny; y++) for (let z = 0; z < nz; z++) {
+      const yy = ((y - cy) * dx) / Math.max(ry, dx * 0.25);
+      const zz = ((z - cz) * dx) / Math.max(rz, dx * 0.25);
+      candidates.push({ y, z, d: yy * yy + zz * zz });
+    }
+    candidates.sort((a, b) => a.d - b.d);
+    const wanted = Math.max(1, Math.min(ny * nz, Math.round(areaCm2 / (dx * dx))));
+    const cutoff = candidates[wanted - 1].d + 1e-12;
+    for (const q of candidates) if (q.d <= cutoff) mask[q.y * nz + q.z] = 1;
+    const cells = mask.reduce((a, b) => a + b, 0), area = cells * dx * dx;
+    return { mask, cells, area, error: area - areaCm2 };
+  }
+
+  function makeTopology(mask, nx, ny, nz, lipOpen) {
+    const total = nx * ny * nz;
+    const ids = new Int32Array(total);
+    ids.fill(-1);
+    let count = 0;
+    for (let i = 0; i < total; i++) if (mask[i]) ids[i] = count++;
+    const cells = new Int32Array(count);
+    const neighbours = new Int32Array(count * 6);
+    for (let x = 0; x < nx; x++) for (let y = 0; y < ny; y++) for (let z = 0; z < nz; z++) {
+      const full = idx(x, y, z, ny, nz), ci = ids[full];
+      if (ci < 0) continue;
+      cells[ci] = full;
+      const coords = [[x - 1, y, z], [x + 1, y, z], [x, y - 1, z], [x, y + 1, z], [x, y, z - 1], [x, y, z + 1]];
+      for (let d = 0; d < 6; d++) {
+        const [xx, yy, zz] = coords[d];
+        let ni = -1; // -1 = rigid wall (mirror pressure); -2 = pressure-release lip ghost
+        if (xx === nx && lipOpen && d === 1) ni = -2;
+        else if (xx >= 0 && xx < nx && yy >= 0 && yy < ny && zz >= 0 && zz < nz) {
+          const candidate = ids[idx(xx, yy, zz, ny, nz)];
+          if (candidate >= 0) ni = candidate;
+        }
+        neighbours[ci * 6 + d] = ni;
+      }
+    }
+    return { cells, neighbours, count };
+  }
+
+  // One leapfrog pressure update for the 3-D scalar acoustic wave equation:
+  // p_tt + 2σ p_t = c² ∇²p + s.
+  // (1+σdt)p[n+1] = 2p[n] - (1-σdt)p[n-1] + λ² Σ_neighbours(p_nb-p).
+  function stepField(prev, curr, next, topology, lambda2 = LAMBDA2, sigmaDt = SIGMA_DT, sourceFn) {
+    const { cells, neighbours, count } = topology;
+    const den = 1 + sigmaDt, oldCoef = 1 - sigmaDt;
+    for (let q = 0; q < count; q++) {
+      const i = cells[q], p = curr[i];
+      let lap = 0;
+      for (let d = 0; d < 6; d++) {
+        const ni = neighbours[q * 6 + d];
+        const pn = ni >= 0 ? curr[cells[ni]] : ni === -2 ? 0 : p;
+        lap += pn - p;
+      }
+      next[i] = (2 * p - oldCoef * prev[i] + lambda2 * lap) / den;
+    }
+    if (sourceFn) sourceFn(next, topology);
+  }
+
+  function buildAllOpenTopology(nx, ny, nz) {
+    return makeTopology(new Uint8Array(nx * ny * nz).fill(1), nx, ny, nz, false);
+  }
+
+  // Initialise a discrete Neumann eigenmode. Its exact discrete frequency is
+  // f = Fs/π asin(λ sqrt(Σ sin²(π m_d/(2N_d)))).
+  function modeFrequency(nx, ny, nz, mx, my, mz, fs = FS, lambda = LAMBDA) {
+    const q = Math.sin(Math.PI * mx / (2 * nx)) ** 2 +
+      Math.sin(Math.PI * my / (2 * ny)) ** 2 + Math.sin(Math.PI * mz / (2 * nz)) ** 2;
+    return fs / Math.PI * Math.asin(Math.min(1, lambda * Math.sqrt(q)));
+  }
+
+  function continuousModeFrequency(nx, ny, nz, mx, my, mz, dx = DX, c = C_CM_S) {
+    const lx = nx * dx, ly = ny * dx, lz = nz * dx;
+    return c / 2 * Math.sqrt((mx / lx) ** 2 + (my / ly) ** 2 + (mz / lz) ** 2);
+  }
+
+  function runEigenmode(opts = {}) {
+    const nx = opts.nx || 33, ny = opts.ny || 7, nz = opts.nz || 9;
+    const mx = opts.mx ?? 0, my = opts.my ?? 0, mz = opts.mz ?? 1;
+    const steps = opts.steps || 32768, fs = opts.fs || FS, lambda = opts.lambda || LAMBDA;
+    const lambda2 = lambda * lambda;
+    const topology = buildAllOpenTopology(nx, ny, nz);
+    const total = nx * ny * nz;
+    let prev = new Float64Array(total), curr = new Float64Array(total), next = new Float64Array(total);
+    for (let x = 0; x < nx; x++) for (let y = 0; y < ny; y++) for (let z = 0; z < nz; z++) {
+      curr[idx(x, y, z, ny, nz)] = Math.cos(Math.PI * mx * (x + 0.5) / nx) *
+        Math.cos(Math.PI * my * (y + 0.5) / ny) * Math.cos(Math.PI * mz * (z + 0.5) / nz);
+    }
+    const probe = idx(Math.floor(nx * 0.37), Math.floor(ny * 0.31), Math.floor(nz * 0.27), ny, nz);
+    const signal = new Float64Array(steps);
+    for (let t = 0; t < steps; t++) {
+      stepField(prev, curr, next, topology, lambda2, 0, null);
+      signal[t] = next[probe];
+      const tmp = prev; prev = curr; curr = next; next = tmp;
+    }
+    // Find the strongest DFT bin near the analytically predicted discrete mode.
+    const theory = modeFrequency(nx, ny, nz, mx, my, mz, fs, lambda);
+    const resolution = fs / steps;
+    const lo = Math.max(1, Math.floor((theory * 0.94) / resolution));
+    const hi = Math.min(Math.floor(steps / 2) - 1, Math.ceil((theory * 1.06) / resolution));
+    let bestK = lo, bestMag = -1;
+    for (let k = lo; k <= hi; k++) {
+      const w = 2 * Math.PI * k / steps; let re = 0, im = 0;
+      for (let t = 0; t < steps; t++) { const a = w * t; re += signal[t] * Math.cos(a); im -= signal[t] * Math.sin(a); }
+      const mag = re * re + im * im;
+      if (mag > bestMag) { bestMag = mag; bestK = k; }
+    }
+    return { measuredHz: bestK * resolution, theoreticalHz: theory, continuousHz: continuousModeFrequency(nx, ny, nz, mx, my, mz, C_CM_S / (fs * lambda), C_CM_S), resolutionHz: resolution,
+      nx, ny, nz, mx, my, mz, relativeError: Math.abs(bestK * resolution - theory) / theory };
+  }
+
+  function createWebsterMesh3D(deps) {
+    assert(deps && typeof deps.kPlan === 'function' && typeof deps.kFrames === 'function',
+      'createWebsterMesh3D requires Webster kPlan and kFrames');
+    assert(typeof deps.shapeFromFormants === 'function', 'shapeFromFormants dependency is required');
+    const KlattSynth = deps.KlattSynth || class {};
+    const areaFunctions = deps.AREA_FUNCTIONS || {};
+    const MESH_L = deps.MESH_L || 32;
+    const areaUnit = deps.MESH_UNIT || 0.35;
+    const smooth = deps.kSmooth || ((a) => a);
+    const pitchFn = deps.kPitch || (() => new Float32Array(0));
+    const kv = deps.KV || {};
+    const ks = deps.KS || {};
+    const kp = deps.KP || {};
+    const kf = deps.KF || {};
+
+    function placeFor(p) {
+      const loc = (areaFunctions[p] || { loc: 85 }).loc;
+      return Math.max(1, Math.min(NX - 2, Math.round((loc / 100) * (NX - 1))));
+    }
+    function resampleArea(a) {
+      const out = new Float32Array(NX);
+      for (let x = 0; x < NX; x++) {
+        const u = x * (a.length - 1) / (NX - 1), i = Math.floor(u), f = u - i;
+        out[x] = a[i] * (1 - f) + a[Math.min(a.length - 1, i + 1)] * f;
+      }
+      return out;
+    }
+    function smoothShapes(shapes, n) {
+      if (!n) return;
+      for (let x = 0; x < NX; x++) {
+        const col = Float32Array.from(shapes, row => row[x]);
+        smooth(col, n);
+        for (let k = 0; k < shapes.length; k++) shapes[k][x] = col[k];
+      }
+    }
+    function makeFrameAreas(frames, cfg) {
+      const fsc = cfg.formantScale || 1, shapes = new Array(frames.length), noiseAt = new Int16Array(frames.length), velAt = new Int16Array(frames.length);
+      for (let k = 0; k < frames.length; k++) {
+        const f = frames[k], p = f.ph || f.phoneme || 'ə';
+        let A = resampleArea(deps.shapeFromFormants((f.F1 || 500) / fsc, (f.F2 || 1400) / fsc));
+        const at = placeFor(p), kind = kp[p] ? 'stop' : kf[p] ? 'fric' : (ks[p] && ks[p][5]) ? 'nasal' : null;
+        noiseAt[k] = Math.min(NX - 2, at + 1);
+        velAt[k] = kind === 'nasal' ? Math.max(1, Math.min(16, at - 2)) : 16;
+        if (kind === 'stop' && !f.burst && !f.ah) for (let x = at - 1; x <= at + 1; x++) if (x >= 0 && x < NX) A[x] = 0;
+        else if (kind === 'stop' && f.burst) for (let x = at - 1; x <= at + 1; x++) if (x >= 0 && x < NX) A[x] = areaUnit;
+        else if (kind === 'fric') for (let x = at - 1; x <= at + 1; x++) if (x >= 0 && x < NX) A[x] = areaUnit;
+        else if (kind === 'nasal') for (let x = at - 1; x <= at + 1; x++) if (x >= 0 && x < NX) A[x] = 0;
+        if (f.silent) A.fill(AREA_BASE);
+        shapes[k] = A;
+      }
+      smoothShapes(shapes, 6);
+      return { shapes, noiseAt, velAt };
+    }
+
+    function renderFrames(frames, cfg = {}) {
+      const sr = OUT_SR;
+      if (!frames || !frames.length) return { samples: new Float32Array(0), sampleRate: sr, timeline: [], metrics: {} };
+      const N = frames.length;
+      const AV = smooth(Float32Array.from(frames, f => f.av || 0), 5);
+      const AH = smooth(Float32Array.from(frames, f => f.ah || 0), 5);
+      const AF = smooth(Float32Array.from(frames, f => f.af || 0), 2.5);
+      const F0 = smooth(cfg._pitch || pitchFn(frames, cfg), 25);
+      const VEL = smooth(Float32Array.from(frames, f => Math.min(1, (f.nasal || 0) / 2)), 12);
+      const { shapes, noiseAt, velAt } = makeFrameAreas(frames, cfg);
+      const totalSteps = Math.round(N * FRAME_MS * FS / 1000) + Math.round(FS * 0.08);
+      const hi = new Float32Array(totalSteps);
+      const total = NX * NY * NZ;
+      let prev = new Float32Array(total), curr = new Float32Array(total), next = new Float32Array(total);
+      let activeMask = new Uint8Array(total), topology = makeTopology(activeMask, NX, NY, NZ, true);
+      let lastMask = new Uint8Array(total);
+      const nasalPrev = new Float32Array(NASAL_CELLS + 2), nasalCurr = new Float32Array(NASAL_CELLS + 2), nasalNext = new Float32Array(NASAL_CELLS + 2);
+      let sourcePhase = 0, period = FS / 115, oq = 0.52, sourceAmp = 1, lp = 0, lpPrev = 0, nasalRadiationPrev = 0;
+      const natural = !!cfg.natural, rough = cfg.roughness || 0, bright = cfg.brightness || 1;
+      const tilt = Math.min(0.85, Math.max(0, 0.45 - 0.35 * (bright - 1) + (natural ? 0.05 : 0)));
+      let seed = 0x13579bdf;
+      const rnd = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 0x7fffffff - 1; };
+      const timeline = [], areaError = { sumAbs: 0, maxAbs: 0, samples: 0 };
+      let lastPh = null, lastFrameStart = 0, stepIndex = 0, peakAbs = 0, sumSq = 0, outputCount = 0;
+      let sourceCells = [], fricCells = [], velumCells = [];
+      let currentGlottal = 0, currentAspiration = 0, currentNoise = 0, currentAF = 0, currentVelum = 0;
+      const injectSources = (dst) => {
+        if (sourceCells.length) {
+          const v = (currentGlottal * 6 + currentAspiration) / sourceCells.length;
+          for (const i of sourceCells) dst[i] += v;
+        }
+        if (currentAF > 0.005 && fricCells.length) {
+          const v = currentNoise * currentAF * 0.018 / fricCells.length;
+          for (const i of fricCells) dst[i] += v;
+        }
+        if (currentVelum > 0.005 && velumCells.length) {
+          let pPort = 0; for (const i of velumCells) pPort += curr[i]; pPort /= velumCells.length;
+          const q = 0.12 * currentVelum * (nasalCurr[1] - pPort);
+          for (const i of velumCells) dst[i] += q / velumCells.length;
+        }
+      };
+
+      function rebuild(A) {
+        lastMask.set(activeMask); activeMask.fill(0);
+        for (let x = 0; x < NX; x++) {
+          const cross = rasterEllipse(A[x], NY, NZ);
+          areaError.sumAbs += Math.abs(cross.error); areaError.maxAbs = Math.max(areaError.maxAbs, Math.abs(cross.error)); areaError.samples++;
+          for (let y = 0; y < NY; y++) for (let z = 0; z < NZ; z++) if (cross.mask[y * NZ + z]) activeMask[idx(x, y, z, NY, NZ)] = 1;
+        }
+        // Newly opened cells inherit the nearest active pressure in the same cross-section;
+        // removed cells are cleared so stale pressure cannot reappear after a closure.
+        for (let x = 0; x < NX; x++) for (let y = 0; y < NY; y++) for (let z = 0; z < NZ; z++) {
+          const i = idx(x, y, z, NY, NZ);
+          if (!activeMask[i]) { if (lastMask[i]) prev[i] = curr[i] = next[i] = 0; continue; }
+          if (lastMask[i]) continue;
+          let found = false;
+          for (let r = 1; r < Math.max(NY, NZ) && !found; r++) for (let dy = -r; dy <= r && !found; dy++) for (let dz = -r; dz <= r && !found; dz++) {
+            const yy = y + dy, zz = z + dz;
+            if (yy < 0 || yy >= NY || zz < 0 || zz >= NZ) continue;
+            const j = idx(x, yy, zz, NY, NZ);
+            if (lastMask[j] && activeMask[j]) { prev[i] = curr[i] = next[i] = curr[j]; found = true; }
+          }
+          if (!found) prev[i] = curr[i] = next[i] = 0;
+        }
+        topology = makeTopology(activeMask, NX, NY, NZ, true);
+      }
+
+      const stepsPerFrame = k => Math.round((k + 1) * FRAME_MS * FS / 1000) - Math.round(k * FRAME_MS * FS / 1000);
+      for (let k = 0; k < N; k++) {
+        const f = frames[k], A = shapes[k], k1 = Math.min(N - 1, k + 1), at = noiseAt[k], vc = velAt[k];
+        rebuild(A);
+        sourceCells = []; fricCells = []; velumCells = [];
+        for (let q = 0; q < topology.count; q++) {
+          const full = topology.cells[q], x = Math.floor(full / (NY * NZ));
+          if (x === 0) sourceCells.push(full);
+          if (x === at) fricCells.push(full);
+          if (x === vc) velumCells.push(full);
+        }
+        const nSteps = stepsPerFrame(k);
+        for (let s = 0; s < nSteps; s++, stepIndex++) {
+          const frac = s / nSteps;
+          const av = AV[k] + (AV[k1] - AV[k]) * frac;
+          const ah = AH[k] + (AH[k1] - AH[k]) * frac;
+          const af = AF[k] + (AF[k1] - AF[k]) * frac;
+          const vel = VEL[k] + (VEL[k1] - VEL[k]) * frac;
+          const f0 = (F0[k] || 115) + ((F0[k1] || F0[k] || 115) - (F0[k] || 115)) * frac;
+          sourcePhase += 1;
+          if (sourcePhase >= period) {
+            sourcePhase -= period;
+            period = FS / Math.max(50, f0 * (1 + (natural ? 0.008 : 0.002) * rnd() + rough * 0.04 * rnd()));
+            sourceAmp = 1 + (natural ? 0.04 : 0.01) * rnd() - rough * 0.25 * Math.abs(rnd());
+            oq = natural ? 0.57 : 0.52;
+          }
+          const phase = sourcePhase / (oq * period);
+          const flow = phase < 1 ? (phase * phase - phase * phase * phase) * 6.75 : 0;
+          const noise = rnd();
+          const rawSource = flow * av * sourceAmp + noise * ((natural ? 0.015 : 0) + rough * 0.15) * av * (phase < 1 ? 1 : 0.15) * 0.6;
+          lp = (1 - tilt) * rawSource + tilt * lp;
+          const glottalSource = lp - lpPrev;
+          const aspiration = noise * ah * 0.075;
+          currentGlottal = glottalSource; currentAspiration = aspiration;
+          currentNoise = noise; currentAF = af; currentVelum = vel;
+          // Reuse one source injector; no callback/function allocation in the sample loop.
+          stepField(prev, curr, next, topology, LAMBDA2, SIGMA_DT, injectSources);
+          if (vel > 0.005 && velumCells.length) {
+            let pPort = 0; for (const i of velumCells) pPort += curr[i]; pPort /= velumCells.length;
+            for (let j = 1; j <= NASAL_CELLS; j++) {
+              const left = j === 1 ? pPort : nasalCurr[j - 1];
+              const right = j === NASAL_CELLS ? 0 : nasalCurr[j + 1];
+              nasalNext[j] = (2 * nasalCurr[j] - (1 - SIGMA_DT) * nasalPrev[j] + LAMBDA2 * (left + right - 2 * nasalCurr[j])) / (1 + SIGMA_DT);
+            }
+            nasalNext[NASAL_CELLS] *= 0.985; // nostril radiation/loss
+          } else {
+            for (let j = 1; j <= NASAL_CELLS; j++) {
+              const left = j === 1 ? nasalCurr[1] : nasalCurr[j - 1]; // closed velum = rigid reflection
+              nasalNext[j] = (2 * nasalCurr[j] - (1 - SIGMA_DT) * nasalPrev[j] + LAMBDA2 * (left + nasalCurr[j + 1] - 2 * nasalCurr[j])) / (1 + SIGMA_DT);
+            }
+          }
+          let lip = 0, lipCount = 0;
+          for (let q = 0; q < topology.count; q++) {
+            const full = topology.cells[q];
+            if (Math.floor(full / (NY * NZ)) === NX - 1) { lip += next[full]; lipCount++; }
+          }
+          const nasalOut = (nasalNext[NASAL_CELLS] - nasalRadiationPrev) * 6;
+          nasalRadiationPrev = nasalNext[NASAL_CELLS];
+          const sample = (lipCount ? lip : 0) + nasalOut;
+          if (stepIndex < hi.length) hi[stepIndex] = sample;
+          peakAbs = Math.max(peakAbs, Math.abs(sample)); sumSq += sample * sample; outputCount++;
+          let tmp = prev; prev = curr; curr = next; next = tmp;
+          tmp = nasalPrev; // swap branch buffers
+          for (let j = 0; j < nasalPrev.length; j++) { const v = nasalPrev[j]; nasalPrev[j] = nasalCurr[j]; nasalCurr[j] = nasalNext[j]; nasalNext[j] = v; }
+          lpPrev = lp;
+        }
+        if (f.ph !== lastPh) {
+          const xMid = Math.floor(NX * 0.55), slice = new Array(NY * NZ).fill(0);
+          for (let y = 0; y < NY; y++) for (let z = 0; z < NZ; z++) slice[y * NZ + z] = curr[idx(xMid, y, z, NY, NZ)];
+          timeline.push({ t: Math.round(k * FRAME_MS) / 1000, phoneme: f.ph, pitch: F0[k], isVoiced: AV[k] > 0.2,
+            isNoise: AF[k] > 0.1 || AH[k] > 0.1, area: Array.from(A), pressureSlice: slice, sliceSize: [NY, NZ] });
+          lastPh = f.ph;
+        }
+        lastFrameStart += nSteps;
+      }
+      const taps = 63, h = new Float64Array(taps), fc = 9500 / FS; let hs = 0;
+      for (let i = 0; i < taps; i++) { const m = i - (taps - 1) / 2; h[i] = (m === 0 ? 2 * fc : Math.sin(2 * Math.PI * fc * m) / (Math.PI * m)) * (0.54 - 0.46 * Math.cos(2 * Math.PI * i / (taps - 1))); hs += h[i]; }
+      const out = new Float32Array(Math.ceil(hi.length / MULT));
+      for (let o = 0; o < out.length; o++) {
+        const center = o * MULT; let sum = 0;
+        for (let j = 0; j < taps; j++) { const q = center + j - (taps >> 1); if (q >= 0 && q < hi.length) sum += hi[q] * h[j]; }
+        out[o] = sum / hs;
+      }
+      let peak = 1e-9; for (const v of out) peak = Math.max(peak, Math.abs(v));
+      const gain = 0.89 / peak;
+      for (let i = 0; i < out.length; i++) out[i] = Math.tanh(out[i] * gain * 1.1) / Math.tanh(1.1);
+      let finite = true; for (const v of out) if (!Number.isFinite(v)) { finite = false; break; }
+      return { samples: out, sampleRate: sr, timeline, metrics: {
+        durationSeconds: out.length / sr, peakBeforeNormalisation: peakAbs,
+        rmsBeforeNormalisation: Math.sqrt(sumSq / Math.max(1, outputCount)), finite,
+        grid: [NX, NY, NZ], dxCm: DX, internalSampleRate: FS, courant: LAMBDA,
+        activeCellAreaMeanAbsErrorCm2: areaError.sumAbs / Math.max(1, areaError.samples),
+        activeCellAreaMaxAbsErrorCm2: areaError.maxAbs, areaSlices: areaError.samples
+      } };
+    }
+
+    function render(phonemes, cfg = {}) {
+      const segs = deps.kPlan(phonemes, cfg);
+      const frames = deps.kFrames(segs, cfg);
+      if (!frames.length) return { samples: new Float32Array(0), sampleRate: OUT_SR, timeline: [], metrics: {} };
+      const F0 = pitchFn(frames, cfg);
+      return renderFrames(frames, { ...cfg, _pitch: F0 });
+    }
+
+    function measureAreaResponse(areaInput, opts = {}) {
+      const area = resampleArea(areaInput);
+      const mask = new Uint8Array(NX * NY * NZ);
+      const areaStats = [];
+      for (let x = 0; x < NX; x++) {
+        const cross = rasterEllipse(area[x], NY, NZ);
+        areaStats.push(Math.abs(cross.error));
+        for (let y = 0; y < NY; y++) for (let z = 0; z < NZ; z++)
+          if (cross.mask[y * NZ + z]) mask[idx(x, y, z, NY, NZ)] = 1;
+      }
+      const topology = makeTopology(mask, NX, NY, NZ, true);
+      const total = NX * NY * NZ, steps = opts.steps || 16384;
+      let prev = new Float64Array(total), curr = new Float64Array(total), next = new Float64Array(total);
+      const source = [];
+      for (let q = 0; q < topology.count; q++) if (Math.floor(topology.cells[q] / (NY * NZ)) === 0) source.push(topology.cells[q]);
+      const y = new Float64Array(steps);
+      for (let t = 0; t < steps; t++) {
+        stepField(prev, curr, next, topology, LAMBDA2, SIGMA_DT, t === 0 ? dst => {
+          if (source.length) for (const i of source) dst[i] += 1 / source.length;
+        } : null);
+        let lip = 0;
+        for (let q = 0; q < topology.count; q++) {
+          const full = topology.cells[q];
+          if (Math.floor(full / (NY * NZ)) === NX - 1) lip += next[full];
+        }
+        y[t] = lip;
+        const tmp = prev; prev = curr; curr = next; next = tmp;
+      }
+      const df = (opts.dfHz || 5), maxHz = opts.maxHz || 5000, bins = Math.floor(maxHz / df);
+      const mag = new Float64Array(bins + 1);
+      for (let k = 1; k <= bins; k++) {
+        const w = 2 * Math.PI * k * df / FS; let re = 0, im = 0;
+        for (let t = 0; t < steps; t++) { const a = w * t; re += y[t] * Math.cos(a); im -= y[t] * Math.sin(a); }
+        mag[k] = Math.hypot(re, im);
+      }
+      const peaks = [];
+      const maxMag = Math.max(...mag);
+      for (let k = 2; k < bins; k++) if (mag[k] > mag[k - 1] && mag[k] >= mag[k + 1] && mag[k] > maxMag * 0.025) {
+        peaks.push({ hz: k * df, magnitude: mag[k] });
+      }
+      peaks.sort((a, b) => b.magnitude - a.magnitude);
+      return { peaks: peaks.slice(0, 8).sort((a, b) => a.hz - b.hz),
+        areaMeanAbsErrorCm2: areaStats.reduce((a, b) => a + b, 0) / areaStats.length,
+        areaMaxAbsErrorCm2: Math.max(...areaStats), steps, sampleRate: FS };
+    }
+
+    class Mesh3DSynth extends KlattSynth {
+      render(phonemeSeq, config) { return render(phonemeSeq, config); }
+    }
+
+    return { render, renderFrames, measureAreaResponse, Mesh3DSynth, constants: { C_CM_S, FS, DX, NX, NY, NZ, MULT, OUT_SR, LAMBDA, LAMBDA2, SIGMA, ASPECT },
+      rasterEllipse, makeTopology, stepField, modeFrequency, runEigenmode };
+  }
+
+  return { createWebsterMesh3D, rasterEllipse, makeTopology, stepField, modeFrequency, continuousModeFrequency, runEigenmode,
+    constants: { C_CM_S, FS, DX, NX, NY, NZ, MULT, OUT_SR, LAMBDA, LAMBDA2, SIGMA, ASPECT, AREA_MIN, AREA_BASE } };
+});
+
+// ==== END WEBSTER MESH 3D CORE ====
+const M3 = WebsterMesh3D.createWebsterMesh3D({
+  KlattSynth, kPlan, kFrames, kPitch, kSmooth, KV, KS, KP, KF, AREA_FUNCTIONS, MESH_L, MESH_UNIT,
+  shapeFromFormants: mShapeFromFormants
+});
+const Mesh3DSynth = M3.Mesh3DSynth;
+
 
 const app = {
     synth: null,
@@ -2433,6 +2881,7 @@ const app = {
         this.synth = new KlattSynth();
         this.retroSynth = new FormantSynth();
         this.dwmSynth = new MeshSynth();
+        this.m3dSynth = new Mesh3DSynth();
         
         const canvas = document.getElementById('visualizer');
         this.canvasCtx = canvas.getContext('2d');
@@ -2459,7 +2908,7 @@ const app = {
         this.synthesisEngine = 'formant';
         this.naturalMode = false;
 
-        const engineBtns = { formant: 'btn-formant', retro: 'btn-retro', dwm: 'btn-dwm' };
+        const engineBtns = { formant: 'btn-formant', retro: 'btn-retro', dwm: 'btn-dwm', m3d: 'btn-m3d' };
         for (const [eng, id] of Object.entries(engineBtns)) document.getElementById(id).addEventListener('click', () => {
             this.stop(); this.synthesisEngine = eng;
             for (const other of Object.values(engineBtns)) document.getElementById(other).classList.toggle('active', other === id);
@@ -2524,7 +2973,7 @@ const app = {
         this.drawVisualizer();
     },
 
-    activeSynth() { return this.synthesisEngine === 'dwm' ? this.dwmSynth : this.synthesisEngine === 'retro' ? this.retroSynth : this.synth; },
+    activeSynth() { return this.synthesisEngine === 'm3d' ? this.m3dSynth : this.synthesisEngine === 'dwm' ? this.dwmSynth : this.synthesisEngine === 'retro' ? this.retroSynth : this.synth; },
 
     resizeCanvas() {
         const canvas = document.getElementById('visualizer');
@@ -2600,7 +3049,7 @@ const app = {
         document.getElementById('btn-stop').classList.remove('hidden');
         document.getElementById('btn-pause').classList.remove('hidden');
         document.getElementById('btn-resume').classList.add('hidden');
-        document.getElementById('status-msg').textContent = `Synthesizing (${({ formant: 'Formant', retro: 'Retro', dwm: 'Physical' })[this.synthesisEngine]})...`;
+        document.getElementById('status-msg').textContent = `Synthesizing (${({ formant: 'Formant', retro: 'Retro', dwm: 'Physical 2D', m3d: 'Physical 3D' })[this.synthesisEngine]})...`;
         
         const pBar = document.getElementById('progress-bar');
         document.getElementById('progress-container').classList.remove('hidden');
@@ -2638,13 +3087,13 @@ const app = {
         activeSynth.resumePlayback();
         document.getElementById('btn-resume').classList.add('hidden');
         document.getElementById('btn-pause').classList.remove('hidden');
-        document.getElementById('status-msg').textContent = `Synthesizing (${({ formant: 'Formant', retro: 'Retro', dwm: 'Physical' })[this.synthesisEngine]})...`;
+        document.getElementById('status-msg').textContent = `Synthesizing (${({ formant: 'Formant', retro: 'Retro', dwm: 'Physical 2D', m3d: 'Physical 3D' })[this.synthesisEngine]})...`;
     },
 
     stop() {
         this.synth.stop();
         this.retroSynth.stop();
-        this.dwmSynth.stop();
+        this.dwmSynth.stop(); this.m3dSynth.stop();
         document.getElementById('btn-stop').classList.add('hidden');
         document.getElementById('btn-pause').classList.add('hidden');
         document.getElementById('btn-resume').classList.add('hidden');
@@ -2662,7 +3111,7 @@ const app = {
         document.getElementById('status-msg').textContent = 'Rendering WAV...';
         const phonemes = this.processText(rawText);
         const config = this.getConfig(rawText);
-        const eng = this.synthesisEngine === 'retro' ? this.retroSynth : this.synthesisEngine === 'dwm' ? this.dwmSynth : this.synth;
+        const eng = this.synthesisEngine === 'retro' ? this.retroSynth : this.synthesisEngine === 'dwm' ? this.dwmSynth : this.synthesisEngine === 'm3d' ? this.m3dSynth : this.synth;
         const blob = await eng.renderToWAV(phonemes, config);
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -2713,7 +3162,7 @@ const app = {
         const activeSynth = this.activeSynth();
         
         // Handle visualizer differently if it's the physical model vs formant model
-        if (activeSynth === this.dwmSynth) {
+        if (activeSynth === this.dwmSynth || activeSynth === this.m3dSynth) {
             const dataArray = new Uint8Array(activeSynth.analyser.frequencyBinCount);
             activeSynth.analyser.getByteTimeDomainData(dataArray);
 
@@ -2745,7 +3194,17 @@ const app = {
                 for (let i = n - 1; i >= 0; i--) ctx.lineTo(x0 + w * i / (n - 1), cy + A[i] * k); ctx.closePath(); ctx.fill(); ctx.stroke();
                 ctx.fillStyle = '#94a3b8'; ctx.font = '12px monospace';
                 ctx.fillText('glottis', x0 - 10, cy + 6 * k + 18); ctx.fillText('lips', x0 + w - 18, cy + 6 * k + 18);
-                ctx.fillText(`Physical: waveguide mesh · /${cur.phoneme}/`, 10, 22);
+                ctx.fillText(`${activeSynth === this.m3dSynth ? 'Physical 3D: volumetric mesh' : 'Physical 2D: waveguide mesh'} · /${cur.phoneme}/`, 10, 22);
+            }
+            // Physical 3D: a real cross-section of the solver's pressure field (blue +, red −), from the timeline
+            if (activeSynth === this.m3dSynth && activeSynth.isPlaying && cur && cur.pressureSlice && cur.sliceSize) {
+                const v = cur.pressureSlice, n = cur.sliceSize[0], m = cur.sliceSize[1]; let pk = 1e-9;
+                for (const a of v) pk = Math.max(pk, Math.abs(a));
+                const cell = Math.min(width * 0.16 / m, height * 0.6 / n), x0 = width - cell * m - 12, y0 = (height - cell * n) / 2;
+                for (let y = 0; y < n; y++) for (let z = 0; z < m; z++) { const a = v[y * m + z] / pk;
+                    ctx.fillStyle = a >= 0 ? `rgba(59,130,246,${Math.min(0.9, Math.abs(a))})` : `rgba(239,68,68,${Math.min(0.9, Math.abs(a))})`;
+                    ctx.fillRect(x0 + z * cell, y0 + y * cell, cell - 1, cell - 1); }
+                ctx.fillStyle = '#94a3b8'; ctx.font = '11px monospace'; ctx.fillText('pressure slice', x0, y0 - 6);
             }
             return;
         }
