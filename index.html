@@ -2282,13 +2282,14 @@ class KlattSynth {
 //             Each 5 ms frame blends the fitted vowels nearest its F1/F2, then consonants are laid on top at their
 //             place: closures for stops and nasals, a narrow channel for fricatives. Shapes are smoothed in time.
 //   noise:    frication is injected just in front of the constriction, aspiration at the glottis.
-//   nose:     a 1-D side branch (11 cm) fed from the velum when it opens, radiating from the nostrils.
+//   nose:     a 1-D side branch (11 cm) fed from the velum when it opens, radiating from the nostrils;
+//             the open velum also leaks pressure out of the oral tract (the nose is an outlet, not just a listener).
 //   source:   the Formant engine's glottal flow, injected as its time derivative (so a closed mouth can't build up
 //             pressure and pop); that one differentiation stands in for the radiation at the lips. Aspiration and
 //             frication noise go in as they are.
 //   output:   lips + nose (the nose, fed by cavity pressure, gets its own radiation difference), low-passed and
 //             decimated to 22,050 Hz. Levels per sound are balanced against the Formant engine.
-// Known limit: front vowels come out low in F2 (/i/ about 20%, /e ɪ j/ 11–14%), so they lean lax. The fitted shape model
+// Known limit: front vowels come out low in F2 (/i/ 22%, /e/ 18%, /ɪ/ 16%, /j/ 13%), so they lean lax. The fitted shape model
 // can't make the tract short and narrow enough in front; measured area functions would.
 const MESH_MULT = 4, MESH_SR = KLATT_SR * MESH_MULT, MESH_L = 32, MESH_H = 24, MESH_UNIT = 0.35, MESH_A0 = 3.0;
 // fitted vowel shapes: [constriction place 0 = glottis … 1 = lips, depth, back widening, front widening, lip rounding, width]
@@ -2319,10 +2320,11 @@ function mRender(phonemes, cfg = {}) {
   const AV = kSmooth(tr('av'), 5), AH = kSmooth(tr('ah'), 5), AF = kSmooth(tr('af'), 2.5), F0 = kSmooth(kPitch(frames, cfg), 25);
   const VEL = kSmooth(Float32Array.from(frames, f => f.nasal ? 1 : 0), 12);
   // ── shapes, frame by frame: the vowel context from the frame's formant targets, then the consonant on top ──
-  const shapes = [], noiseAt = new Int16Array(N);
+  const shapes = [], noiseAt = new Int16Array(N), velAt = new Int16Array(N);
   for (let k = 0; k < N; k++) { const f = frames[k], p = f.ph;
     const A = mShapeFromFormants(f.F1 / fsc, f.F2 / fsc), at = mPlace(p), kind = KP[p] ? 'stop' : KF[p] ? 'fric' : (KS[p] && KS[p][5]) ? 'nasal' : null;
     noiseAt[k] = Math.min(MESH_L - 1, at + 1);
+    velAt[k] = kind === 'nasal' && at - 2 < 16 ? Math.max(1, at - 2) : 16;   // the nasal port opens behind the closure (for ŋ the tongue closes at the velum itself)
     if (kind === 'stop' && !f.burst && !f.ah) for (let c = at - 1; c <= at + 1; c++) { if (c >= 0 && c < MESH_L) A[c] = 0; }   // closure
     else if (kind === 'stop' && f.burst) { for (let c = at - 1; c <= at + 1; c++) if (c >= 0 && c < MESH_L) A[c] = MESH_UNIT; }  // release
     else if (kind === 'fric') { for (let c = at - 1; c <= at + 1; c++) if (c >= 0 && c < MESH_L) A[c] = MESH_UNIT; }           // narrow channel
@@ -2363,7 +2365,7 @@ function mRender(phonemes, cfg = {}) {
     const k1 = Math.min(k + 1, N - 1), g0 = [], at = noiseAt[k];
     for (let r = 1; r <= MESH_H; r++) if (open[1 * rows + r]) g0.push(1 * rows + r);
     const nz = []; for (let r = 1; r <= MESH_H; r++) if (open[(at + 1) * rows + r]) nz.push((at + 1) * rows + r);
-    const vl = []; for (let r = 1; r <= MESH_H; r++) if (open[(velCol + 1) * rows + r]) vl.push((velCol + 1) * rows + r);
+    const vc = velAt[k], vl = []; for (let r = 1; r <= MESH_H; r++) if (open[(vc + 1) * rows + r]) vl.push((vc + 1) * rows + r);
     for (let s = 0; s < spf; s++) {
       const x = s / spf, av = AV[k] + (AV[k1] - AV[k]) * x, ah = AH[k] + (AH[k1] - AH[k]) * x, af = AF[k] + (AF[k1] - AF[k]) * x, vel = VEL[k] + (VEL[k1] - VEL[k]) * x;
       phase += 1;
@@ -2385,6 +2387,11 @@ function mRender(phonemes, cfg = {}) {
       if (af > 0.005 && nz.length) { const v = nlp * af * 0.018 / nz.length; for (const i of nz) cN[i] += v; }
       // nose: driven by the pressure at the velum, in proportion to how open it is
       let pv = 0; for (const i of vl) pv += b[i]; pv = vl.length ? pv / vl.length : 0;
+      // an open velum is an outlet: with the mouth closed for m/n/ŋ, air leaves through the nose, so the cavity
+      // behind the closure must not seal. (One-way coupling sealed it, pressure built up for the whole nasal and
+      // burst out at the release: the "pop" after a long /n/.) A small pressure leak at the velum, scaled by how
+      // open it is, stands in for the nose's low impedance.
+      if (vel > 0.01) for (const i of vl) cN[i] -= vel * 0.02 * b[i];
       for (let j = 1; j <= NL; j++) { const w = qb[j - 1 > 0 ? j - 1 : 1], e = j < NL ? qb[j + 1] : 0;
         qc[j] = (0.5 * (w + e + 2 * qb[j]) - (1 - beta) * qa[j]) / (1 + beta); }
       qc[1] += pv * vel * 0.5;

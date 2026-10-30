@@ -11,7 +11,7 @@ Offline local formant speech synthesis.
 |---|---|
 | **Formant** (default, v4) | Klatt-style synthesis, the design behind MITalk and DECtalk. A glottal pulse runs through a cascade of five resonators (the vocal tract). Noise runs through parallel bands for hiss and stop bursts, with aspiration after p/t/k and nasal zeros for m/n/ŋ. Transitions between sounds are smoothed both ways in time, which is where coarticulation comes from. It renders samples directly, so what you hear is exactly what *Export WAV* saves. |
 | **Retro** | The original v3 engine: a sawtooth through three band filters. Buzzier and very 1980s. Kept on purpose. |
-| **Physical** (v5, experimental) | A 2-D digital waveguide mesh of the vocal tract: a 17.6 cm grid of cells, its width at each point following the tract's shape, through which pressure waves actually travel. It is driven by the same plan, melody and glottal pulse as Formant, so only the tract differs. Vowel shapes are fitted against the mesh itself to the same formant targets (most within 0–6%); consonants close or narrow the tract at their place, with noise at the constriction and a nasal branch that opens for m/n/ŋ. It renders about twice as fast as real time. Known limit: front vowels come out low in F2 (/i/ about 20%), so they sound a bit lax. |
+| **Physical** (v5, experimental) | A 2-D digital waveguide mesh of the vocal tract: a 17.6 cm grid of cells, its width at each point following the tract's shape, through which pressure waves actually travel. It is driven by the same plan, melody and glottal pulse as Formant, so only the tract differs. Vowel shapes are fitted against the mesh itself to the same formant targets (most within 0–6%); consonants close or narrow the tract at their place, with noise at the constriction and a nasal branch that opens for m/n/ŋ. It renders about twice as fast as real time. Known limit: front vowels come out low in F2 (/i/ 22%, /e/ 18%, /ɪ/ 16%), so they sound a bit lax. |
 
 ## Languages
 
@@ -37,6 +37,10 @@ The [Pip Suite](https://github.com/ConsciousNode/HTMLNLM) (Pip's Room, Multi-Pip
 `node tests/webster-mesh.js` (no dependencies) checks the Physical engine: a uniform tube rings at its quarter-wave modes (480/1440/2395 Hz, theory 480/1439/2399), the fitted vowels ring near their targets, and a whole sentence renders with no sound louder than twice the median vowel.
 
 ## Changelog
+
+### v5.1 — 2026-10-29 · Kham + Kehai Interim
+- **The pop after nasals is gone.** The nose branch only listened to the tract and never drained it, so with the mouth closed for m/n/ŋ the cavity behind the closure was sealed. Pressure built up for the whole nasal and burst out at the release: one thump after "in Ninety" twice as loud as anything else, which also made the whole sentence quieter by setting the volume. Now an open velum leaks pressure, as the real nose does, and for ŋ the nasal port sits behind the tongue's closure. Peak after the long /n/ went from 15.8× a typical level to 5.0× (an ordinary vowel peak), and overall loudness doubled.
+- Corrected the front-vowel F2 numbers: /e/ and /ɪ/ are 18% and 16% low, not 11–14% as v5 said.
 
 ### v5 — 2026-10-29 · Kham + Kehai Interim
 - **Physical engine rebuilt.** The v3 mesh never made a sound (its output tap at the lips was decoupled from the mesh, so it stayed at zero). It now speaks: a new mesh core at 88.2 kHz with a real 17.6 cm tract, vowel shapes fitted against the mesh, consonant closures and channels, frication and aspiration noise, a nasal branch, and levels balanced against Formant sound by sound.
