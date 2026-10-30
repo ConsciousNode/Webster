@@ -465,7 +465,7 @@
     <h3 style="margin-bottom:0.5rem;">Synthesis Engines</h3>
     <p style="color:var(--text-muted);margin-bottom:0.5rem;"><strong>Formant</strong> — Klatt-style synthesis (v4): a glottal pulse through a cascade of five resonators, noise through parallel bands for hiss and bursts, smooth transitions between sounds. The default.</p>
     <p style="color:var(--text-muted);margin-bottom:0.5rem;"><strong>Retro</strong> — the original v3 engine: a sawtooth through three band filters. Buzzier, very 1980s.</p>
-    <p style="color:var(--text-muted);margin-bottom:1rem;"><strong>Physical</strong> — 2-D digital waveguide mesh modeling the vocal tract geometry. Produces natural formant transitions and realistic consonant articulation. Experimental.</p>
+    <p style="color:var(--text-muted);margin-bottom:1rem;"><strong>Physical</strong> — a 2-D waveguide mesh of a 17.6 cm vocal tract: sound actually travels through a simulated tube shaped for each sound. Same voice and melody as Formant, a rounder, more resonant tract. Slower to render (about half real time). Front vowels like the "ee" in "see" come out a little lax. Experimental.</p>
   </div>
 </div>
 
@@ -836,371 +836,8 @@ const AREA_FUNCTIONS = {
 };
 
 
-/**
- * DIGITAL WAVEGUIDE MESH (DWM) VOCAL TRACT MODEL
- * 2-D rectilinear mesh with excitation source injection
- * Includes glottal pulse generation and phoneme-based excitation
- */
-class DWMSynth {
-    constructor() {
-        this.ctx = new (window.AudioContext || window.webkitAudioContext)();
-        this.isPlaying = false;
-        this.isPaused = false;
-        this.sessionId = 0;
-
-        // Mesh dimensions (padded for boundary walls)
-        this.cols = 34; 
-        this.rows = 26; 
-        this.totalNodes = this.cols * this.rows;
-
-        // Three pressure buffers: p_curr, p_prev, p_next
-        this.p_curr = new Float32Array(this.totalNodes);
-        this.p_prev = new Float32Array(this.totalNodes);
-        this.p_next = new Float32Array(this.totalNodes);
-        
-        // Wall indicator: 1 = closed, 0 = open (air)
-        this.isWall = new Uint8Array(this.totalNodes);
-
-        // Excitation source properties (BUG FIX 1)
-        this.phase = 0;
-        this.pitch = 120;
-        this.voiced = true;
-        this.noiseAmp = 0;
-        this.voicedAmp = 0.8;
-
-        this.initWalls();
-
-        // Audio graph
-        this.masterGain = this.ctx.createGain();
-        this.masterGain.gain.value = 0;
-
-        this.analyser = this.ctx.createAnalyser();
-        this.analyser.fftSize = 2048;
-
-        this.masterGain.connect(this.analyser);
-        this.analyser.connect(this.ctx.destination);
-
-        // Lip radiation filter (1st-order high-pass)
-        this.lipFilter = this.ctx.createBiquadFilter();
-        this.lipFilter.type = 'highpass';
-        this.lipFilter.frequency.value = 350;
-        this.lipFilter.Q.value = 0.7;
-        this.lipFilter.connect(this.masterGain);
-
-        // ScriptProcessor: 1 input channel (for glottal source), 1 output channel
-        this.processor = this.ctx.createScriptProcessor(4096, 1, 1);
-        this.processor.onaudioprocess = (e) => this.processMesh(e);
-        this.processor.connect(this.lipFilter);
-
-        // Glottal excitation
-        this.voicedSource = this.ctx.createOscillator();
-        this.voicedSource.type = 'sawtooth';
-        this.voicedSource.start();
-
-        // Glottal Lowpass Filter
-        this.glottalFilter = this.ctx.createBiquadFilter();
-        this.glottalFilter.type = 'lowpass';
-        this.glottalFilter.frequency.value = 800;
-        this.glottalFilter.Q.value = 0.5;
-
-        this.glottalGain = this.ctx.createGain();
-        this.glottalGain.gain.value = 0;
-        
-        // Reroute: source -> filter -> gain -> processor
-        this.voicedSource.connect(this.glottalFilter);
-        this.glottalFilter.connect(this.glottalGain);
-        this.glottalGain.connect(this.processor);
-
-        // Noise source (for fricatives)
-        const bufferSize = this.ctx.sampleRate * 2;
-        const noiseBuffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
-        const output = noiseBuffer.getChannelData(0);
-        for (let i = 0; i < bufferSize; i++) {
-            output[i] = Math.random() * 2 - 1;
-        }
-        this.noiseSource = this.ctx.createBufferSource();
-        this.noiseSource.buffer = noiseBuffer;
-        this.noiseSource.loop = true;
-        this.noiseSource.start();
-
-        // Direct noise path (bypasses mesh for crisp fricatives)
-        this.noiseFilter = this.ctx.createBiquadFilter();
-        this.noiseFilter.type = 'bandpass';
-        this.noiseFilter.Q.value = 2.0;
-        this.noiseFilter.connect(this.masterGain);
-
-        this.noiseGain = this.ctx.createGain();
-        this.noiseGain.gain.value = 0;
-        this.noiseSource.connect(this.noiseGain);
-        this.noiseGain.connect(this.noiseFilter);
-    }
-
-    initWalls() {
-        this.isWall.fill(0);
-        // Top and bottom boundaries (row 0 and row rows-1)
-        for (let c = 0; c < this.cols; c++) {
-            this.isWall[c * this.rows + 0] = 1;
-            this.isWall[c * this.rows + (this.rows - 1)] = 1;
-        }
-    }
-
-    // BUG FIX 1: Glottal pulse method - Rosenberg-C approximation
-    glottalPulse(phase) {
-        const p = phase % 1.0;
-        if (p < 0.4) return Math.sin(Math.PI * p / 0.4) * 0.9;
-        return -Math.sin(Math.PI * (p - 0.4) / 0.6) * 0.3;
-    }
-
-    setAreaFunction(areaFunc, rateMult) {
-        // Reset all interior cells to open (0) except the fixed boundaries
-        for (let c = 1; c < this.cols - 1; c++) {
-            for (let r = 1; r < this.rows - 1; r++) {
-                this.isWall[c * this.rows + r] = 0;
-            }
-        }
-        if (!areaFunc) return;
-
-        const constrLoc = 1 + areaFunc.loc * 32 / 100;  // scale to interior columns (1..32)
-        const constrDegree = areaFunc.degree;
-        const constrWidth = 4 + constrDegree * 6;
-
-        for (let col = 1; col <= 32; col++) {
-            const dist = Math.abs(col - constrLoc);
-            let degree = 0;
-            if (dist < constrWidth) {
-                const normalized = dist / constrWidth;
-                degree = constrDegree * 0.5 * (1.0 + Math.cos(Math.PI * normalized));
-            }
-
-            // Lip rounding effect: close some cells near lips
-            if (col > 28) {
-                degree = Math.max(degree, areaFunc.rounding * 0.8);
-            }
-
-            // Close physical rows from top and bottom based on degree
-            const closedEachSide = Math.floor(degree * 11.5);
-            for (let r = 1; r <= closedEachSide; r++) {
-                this.isWall[col * this.rows + r] = 1;
-                this.isWall[col * this.rows + (this.rows - 1 - r)] = 1;
-            }
-        }
-    }
-
-    processMesh(e) {
-        const input = e.inputBuffer.getChannelData(0);
-        const output = e.outputBuffer.getChannelData(0);
-        const numSamples = output.length;
-        const sampleRate = this.ctx.sampleRate;
-        const N = this.rows;
-
-        if (!this.isPlaying) {
-            for (let i = 0; i < numSamples; i++) output[i] = 0;
-            return;
-        }
-
-        // Constants
-        const alpha = 0.25;    // wave propagation constant (c^2 * dt^2 / dx^2)
-        const damping = 0.999;  // air absorption per step
-
-        for (let sample = 0; sample < numSamples; sample++) {
-            // 1. Compute next pressure for all interior nodes
-            for (let col = 1; col < this.cols - 1; col++) {
-                for (let row = 1; row < this.rows - 1; row++) {
-                    const idx = col * this.rows + row;
-                    if (this.isWall[idx]) {
-                        this.p_next[idx] = 0;
-                        continue;
-                    }
-
-                    const N_idx = (col - 1) * this.rows + row;
-                    const S_idx = (col + 1) * this.rows + row;
-                    const E_idx = col * this.rows + (row + 1);
-                    const W_idx = col * this.rows + (row - 1);
-
-                    // Neighbour pressures (if neighbour is a wall, use current pressure to simulate closed boundary)
-                    const pN = this.isWall[N_idx] ? this.p_curr[idx] : this.p_curr[N_idx];
-                    const pS = this.isWall[S_idx] ? this.p_curr[idx] : this.p_curr[S_idx];
-                    const pE = this.isWall[E_idx] ? this.p_curr[idx] : this.p_curr[E_idx];
-                    const pW = this.isWall[W_idx] ? this.p_curr[idx] : this.p_curr[W_idx];
-
-                    const laplacian = pN + pS + pE + pW - 4 * this.p_curr[idx];
-                    this.p_next[idx] = (2 * this.p_curr[idx] - this.p_prev[idx] + alpha * laplacian) * damping;
-                }
-            }
-
-            // 2. Apply open-end boundary condition at lips (col = cols-2)
-            const lipCol = this.cols - 2;
-            for (let row = 0; row < this.rows; row++) {
-                const idx = lipCol * this.rows + row;
-                // Open end: pressure release (reflection coefficient -1)
-                this.p_next[idx] = -this.p_curr[idx];
-            }
-
-            // BUG FIX 1: Inject excitation at glottis (col = 1, centre rows)
-            const midRow = N >> 1;
-            if (this.voiced && this.voicedAmp > 0) {
-                this.phase += this.pitch / sampleRate;
-                const pulse = this.glottalPulse(this.phase) * this.voicedAmp * 28000;
-                for (let dy = -1; dy <= 1; dy++) {
-                    const row = Math.max(0, Math.min(N-1, midRow + dy));
-                    const idx = 1 * this.rows + row;
-                    this.p_next[idx] = Math.min(32767, Math.max(-32768,
-                        this.p_next[idx] + Math.floor(pulse * (dy === 0 ? 1.0 : 0.5))
-                    ));
-                }
-            }
-            if (this.noiseAmp > 0) {
-                const cx = Math.floor(0.5 * (this.cols-1));
-                const cy = Math.floor(0.5 * (this.rows-1));
-                const noise = (Math.random() * 2 - 1) * this.noiseAmp * 12000;
-                const idx = Math.max(0, Math.min(this.totalNodes-1, cy * N + cx));
-                this.p_next[idx] = Math.min(32767, Math.max(-32768, this.p_next[idx] + Math.floor(noise)));
-            }
-
-            // 3. Also inject source from voiced oscillator at glottis
-            const glottisCol = 1;
-            const centerRow = Math.floor(this.rows / 2);
-            const sourceValue = input[sample] * 0.5;
-            for (let r = centerRow - 2; r <= centerRow + 2; r++) {
-                if (r >= 1 && r < this.rows - 1) {
-                    const idx = glottisCol * this.rows + r;
-                    this.p_next[idx] += sourceValue;
-                }
-            }
-
-            // 4. Output tap at lips (col = cols-2, centre row)
-            const lipIdx = (this.cols - 2) * this.rows + centerRow;
-            output[sample] = this.p_next[lipIdx] * 0.8;   // scale for audible level
-
-            // 5. Rotate buffers for next time step
-            const tmp = this.p_prev;
-            this.p_prev = this.p_curr;
-            this.p_curr = this.p_next;
-            this.p_next = tmp;
-        }
-    }
-
-    // BUG FIX 1: Handle phoneme messages for excitation
-    setPhonemeExcitation(phoneme, pitch) {
-        if (pitch) this.pitch = pitch;
-        this.voiced = VOICING[phoneme] !== false;
-        this.voicedAmp = VOICING[phoneme] ? 0.85 : 0;
-        this.noiseAmp = NOISE_AMP[phoneme] || 0;
-    }
-
-    playSequence(phonemeSeq, config, onProgress, onComplete) {
-        this.resumePlayback();
-        this.stop();
-        this.isPlaying = true;
-
-        this.sessionId++;
-        const mySession = this.sessionId;
-
-        const rateMult = 1 / config.rate;
-        const startTime = this.ctx.currentTime + 0.1;
-        let time = startTime;
-
-        this.masterGain.gain.cancelScheduledValues(startTime);
-        this.masterGain.gain.setValueAtTime(0, startTime);
-        this.masterGain.gain.linearRampToValueAtTime(2.5, startTime + 0.05); 
-        this.masterGain.gain.setValueAtTime(2.5, startTime + 0.06);
-
-        let totalDur = 0;
-
-        phonemeSeq.forEach((p, i) => {
-            const pData = PHONEMES[p] || PHONEMES['_'];
-            const areaFunc = AREA_FUNCTIONS[p];
-            const dur = (pData.dur / 1000) * rateMult;
-
-            // Schedule area function change just before the phoneme starts
-            const delayMs = (time - this.ctx.currentTime) * 1000;
-            setTimeout(() => {
-                if (this.isPlaying && this.sessionId === mySession) {
-                    this.setAreaFunction(areaFunc, rateMult);
-                }
-            }, Math.max(0, delayMs));
-
-            // BUG FIX 1: Schedule phoneme excitation
-            const _ph = p;
-            const _pitch = config.pitch;
-            setTimeout(() => {
-                if (this.isPlaying && this.sessionId === mySession) {
-                    this.setPhonemeExcitation(_ph, _pitch);
-                }
-            }, Math.max(0, delayMs));
-
-            // Pitch control
-            this.voicedSource.frequency.setValueAtTime(config.pitch, time);
-
-            // Glottal gain (voiced sounds)
-            if (pData.type.includes('vowel') || pData.type.includes('approximant') || 
-                pData.type.includes('nasal') || pData.type === 'fricative_voiced') {
-                this.glottalGain.gain.setValueAtTime(0, time);
-                this.glottalGain.gain.linearRampToValueAtTime(pData.amp * 0.8, time + dur * 0.2);
-                this.glottalGain.gain.setValueAtTime(pData.amp * 0.8, time + dur * 0.8);
-                this.glottalGain.gain.linearRampToValueAtTime(0, time + dur);
-            } else {
-                this.glottalGain.gain.setValueAtTime(0, time);
-            }
-
-            // Noise gain (fricatives/plosives)
-            this.noiseFilter.frequency.setValueAtTime(pData.noiseFreq || 3000, time);
-            if (pData.type.includes('fricative') || pData.type.includes('plosive')) {
-                this.noiseGain.gain.setValueAtTime(0, time);
-                this.noiseGain.gain.linearRampToValueAtTime(pData.amp * 0.5, time + dur * 0.1);
-                this.noiseGain.gain.setValueAtTime(pData.amp * 0.5, time + dur * 0.9);
-                this.noiseGain.gain.linearRampToValueAtTime(0, time + dur);
-            } else {
-                this.noiseGain.gain.setValueAtTime(0, time);
-            }
-
-            time += dur;
-            totalDur += dur;
-        });
-
-        this.masterGain.gain.setValueAtTime(2.5, time);
-        this.masterGain.gain.linearRampToValueAtTime(0, time + 0.1);
-
-        setTimeout(() => {
-            if (this.sessionId === mySession) {
-                this.isPlaying = false;
-                if (onComplete) onComplete();
-            }
-        }, (time - this.ctx.currentTime + 0.1) * 1000);
-    }
-
-    pause() {
-        if (this.ctx.state === 'running') this.ctx.suspend();
-        this.isPaused = true;
-    }
-
-    resumePlayback() {
-        if (this.ctx.state === 'suspended') this.ctx.resume();
-        this.isPaused = false;
-    }
-
-    stop() {
-        this.isPlaying = false;
-        this.isPaused = false;
-        const now = this.ctx.currentTime;
-        this.masterGain.gain.cancelScheduledValues(now);
-        this.masterGain.gain.setValueAtTime(this.masterGain.gain.value, now);
-        this.masterGain.gain.linearRampToValueAtTime(0, now + 0.1);
-        this.glottalGain.gain.cancelScheduledValues(now);
-        this.noiseGain.gain.cancelScheduledValues(now);
-        
-        // Reset pressure buffers
-        this.p_curr.fill(0);
-        this.p_prev.fill(0);
-        this.p_next.fill(0);
-        
-        // Reset excitation
-        this.phase = 0;
-        this.voiced = true;
-        this.noiseAmp = 0;
-        this.voicedAmp = 0.8;
-    }
-}
+// (The v3 Physical engine's DWMSynth lived here. It never made a sound: its output tap at the lips was decoupled
+// from the mesh, so it stayed at zero. v5 replaces it with the mesh core further down; webster-v3.html keeps the original.)
 
 function engInflectionPhonemes(word) {
     if (word.endsWith('ed') && word.length > 3) {
@@ -2631,6 +2268,151 @@ class KlattSynth {
     }
 }
 // ==== WEBSTER CORE v4 END ====
+// ==== WEBSTER MESH CORE (v5) ====
+// The Physical engine: a 2-D digital waveguide mesh of the vocal tract, driven by the same plan, frames, pitch and
+// glottal source as the Formant engine above, so only the vocal tract differs. Plain JavaScript; renders samples
+// directly (playback and WAV export are the same audio), so it can be tested outside a browser.
+//   mesh:     rectilinear 2-D waveguide mesh in its FDTD form, p' = (½·Σneighbours − (1−β)·p_prev) / (1+β),
+//             run at 4 × 22,050 Hz, so one cell is 0.55 cm and the tract is a real 17.6 cm long. Its width at each
+//             point follows the tract's area there (0.35 cm² per row). Closed at the glottis, a pressure-release
+//             open end at the lips; β is a small loss that damps without detuning.
+//             (Checked: a uniform tube rings at 477/1438/2396/3350 Hz against 480/1439/2399/3358 in theory.)
+//   shapes:   vowel area functions fitted, against this mesh's own impulse response, to the same Peterson & Barney
+//             targets the Formant engine uses (MV): most land within 0–6% of F1/F2.
+//             Each 5 ms frame blends the fitted vowels nearest its F1/F2, then consonants are laid on top at their
+//             place: closures for stops and nasals, a narrow channel for fricatives. Shapes are smoothed in time.
+//   noise:    frication is injected just in front of the constriction, aspiration at the glottis.
+//   nose:     a 1-D side branch (11 cm) fed from the velum when it opens, radiating from the nostrils.
+//   source:   the Formant engine's glottal flow, injected as its time derivative (so a closed mouth can't build up
+//             pressure and pop); that one differentiation stands in for the radiation at the lips. Aspiration and
+//             frication noise go in as they are.
+//   output:   lips + nose (the nose, fed by cavity pressure, gets its own radiation difference), low-passed and
+//             decimated to 22,050 Hz. Levels per sound are balanced against the Formant engine.
+// Known limit: front vowels come out low in F2 (/i/ about 20%, /e ɪ j/ 11–14%), so they lean lax. The fitted shape model
+// can't make the tract short and narrow enough in front; measured area functions would.
+const MESH_MULT = 4, MESH_SR = KLATT_SR * MESH_MULT, MESH_L = 32, MESH_H = 24, MESH_UNIT = 0.35, MESH_A0 = 3.0;
+// fitted vowel shapes: [constriction place 0 = glottis … 1 = lips, depth, back widening, front widening, lip rounding, width]
+const MV = {'i': [0.661, 0.732, 1.484, 1.592, 0.077, 0.274], 'ɪ': [0.65, 0.59, 0.445, 1.073, 0.039, 0.214], 'e': [0.645, 0.511, 0.004, 1.119, 0.057, 0.223], 'ɛ': [0.055, 0.854, 0.001, 0.001, 0.001, 0.22], 'æ': [0.078, 0.773, 1.574, 1.562, 0.02, 0.239], 'a': [0.163, 0.927, 0.024, 1.66, 0.012, 0.292], 'ɔ': [0.206, 0.933, 1.511, 1.601, 0.197, 0.258], 'o': [0.219, 0.764, 1.657, 1.475, 0.548, 0.273], 'ʊ': [0.33, 0.675, 0.189, 0.116, 0.435, 0.234], 'u': [0.526, 0.837, 0.07, 0.099, 0.741, 0.229], 'ʌ': [0.189, 0.598, 1.459, 1.576, 0.026, 0.234], 'ə': [0.396, 0.003, 0.479, 0.47, 0.003, 0.225], 'ɨ': [0.794, 0.332, 0.786, 1.113, 0.293, 0.27], 'ø': [0.706, 0.003, 0.879, 1.095, 0.315, 0.22], 'y': [0.643, 0.812, 0.936, 1.491, 0.039, 0.274], 'ɯ': [0.931, 0.644, 0.214, 0.111, 0.038, 0.198], 'w': [0.366, 0.878, 1.659, 1.552, 0.823, 0.247], 'j': [0.68, 0.811, 1.257, 1.522, 0.067, 0.273], 'l': [0.479, 0.81, 1.138, 1.523, 0.549, 0.265], 'r': [0.117, 0.841, 0.112, 0.089, 0.889, 0.12], 'ʎ': [0.672, 0.622, 1.354, 1.551, 0.104, 0.265]};
+const MESH_X = Float32Array.from({ length: MESH_L }, (_, c) => (c + 0.5) / MESH_L);
+function mVowelArea(p) {
+  const [loc, d, eb, ef, lip, wd] = p, A = new Float32Array(MESH_L);
+  for (let c = 0; c < MESH_L; c++) { const x = MESH_X[c], dx = Math.abs(x - loc);
+    const bump = dx < wd ? 0.5 * (1 + Math.cos(Math.PI * dx / wd)) : 0, wide = dx < 0.45 ? 0.5 * (1 + Math.cos(Math.PI * dx / 0.45)) : 0;
+    A[c] = MESH_A0 * (1 - d * bump) * (1 + (x < loc ? eb : ef) * (1 - wide)); }
+  for (let c = MESH_L - 3; c < MESH_L; c++) A[c] *= 1 - lip;
+  return A; }
+const MESH_VOWELS = Object.keys(MV).filter(v => KV[v] || KS[v]).map(v => ({ v, F1: Math.log((KV[v] || KS[v])[0]), F2: Math.log((KV[v] || KS[v])[1]), A: mVowelArea(MV[v]) }));
+function mShapeFromFormants(F1, F2) {            // blend the three fitted shapes nearest (F1, F2), by inverse distance
+  const l1 = Math.log(Math.max(150, F1)), l2 = Math.log(Math.max(400, F2));
+  const near = MESH_VOWELS.map(m => ({ m, d: Math.hypot((l1 - m.F1) * 1.4, l2 - m.F2) + 1e-3 })).sort((a, b) => a.d - b.d).slice(0, 3);
+  const A = new Float32Array(MESH_L); let wsum = 0;
+  for (const { m, d } of near) { const w = 1 / (d * d); wsum += w; for (let c = 0; c < MESH_L; c++) A[c] += m.A[c] * w; }
+  for (let c = 0; c < MESH_L; c++) A[c] /= wsum; return A; }
+const mPlace = p => Math.min(MESH_L - 1, Math.max(1, Math.round(((AREA_FUNCTIONS[p] || { loc: 85 }).loc / 100) * (MESH_L - 1))));
+
+/** Render a phoneme list with the mesh. cfg as kRender. Returns { samples, sampleRate, timeline } (timeline carries tract shapes). */
+function mRender(phonemes, cfg = {}) {
+  const sr = KLATT_SR, fsc = cfg.formantScale || 1, natural = !!cfg.natural;
+  const segs = kPlan(phonemes, cfg), frames = kFrames(segs, cfg), N = frames.length;
+  if (!N) return { samples: new Float32Array(0), sampleRate: sr, timeline: [] };
+  const tr = k => Float32Array.from(frames, f => f[k] || 0);
+  const AV = kSmooth(tr('av'), 5), AH = kSmooth(tr('ah'), 5), AF = kSmooth(tr('af'), 2.5), F0 = kSmooth(kPitch(frames, cfg), 25);
+  const VEL = kSmooth(Float32Array.from(frames, f => f.nasal ? 1 : 0), 12);
+  // ── shapes, frame by frame: the vowel context from the frame's formant targets, then the consonant on top ──
+  const shapes = [], noiseAt = new Int16Array(N);
+  for (let k = 0; k < N; k++) { const f = frames[k], p = f.ph;
+    const A = mShapeFromFormants(f.F1 / fsc, f.F2 / fsc), at = mPlace(p), kind = KP[p] ? 'stop' : KF[p] ? 'fric' : (KS[p] && KS[p][5]) ? 'nasal' : null;
+    noiseAt[k] = Math.min(MESH_L - 1, at + 1);
+    if (kind === 'stop' && !f.burst && !f.ah) for (let c = at - 1; c <= at + 1; c++) { if (c >= 0 && c < MESH_L) A[c] = 0; }   // closure
+    else if (kind === 'stop' && f.burst) { for (let c = at - 1; c <= at + 1; c++) if (c >= 0 && c < MESH_L) A[c] = MESH_UNIT; }  // release
+    else if (kind === 'fric') { for (let c = at - 1; c <= at + 1; c++) if (c >= 0 && c < MESH_L) A[c] = MESH_UNIT; }           // narrow channel
+    else if (kind === 'nasal') { for (let c = at - 1; c <= at + 1; c++) if (c >= 0 && c < MESH_L) A[c] = 0; }                // oral closure
+    if (f.silent) A.fill(MESH_A0);
+    shapes.push(A); }
+  for (let c = 0; c < MESH_L; c++) { const col = Float32Array.from(shapes, A => A[c]); kSmooth(col, 6); for (let k = 0; k < N; k++) shapes[k][c] = col[k]; }
+  // ── the mesh ──
+  const rows = MESH_H + 2, n = (MESH_L + 2) * rows, beta = Math.PI * 55 / MESH_SR;
+  let a = new Float32Array(n), b = new Float32Array(n), cN = new Float32Array(n);
+  const open = new Uint8Array(n), list = new Int32Array(n), nb = new Int32Array(n * 4); let nOpen = 0;
+  const rowsOf = A => Math.max(0, Math.min(MESH_H, Math.round(A / MESH_UNIT)));
+  function reshape(A) {
+    const was = open.slice(); open.fill(0);
+    for (let c = 0; c < MESH_L; c++) { const w = rowsOf(A[c]), r0 = 1 + ((MESH_H - w) >> 1); for (let r = r0; r < r0 + w; r++) open[(c + 1) * rows + r] = 1; }
+    nOpen = 0;
+    // a cell that opens takes the pressure of the nearest cell that was already open in its column, so a wall moving
+    // by one row doesn't drop a zero into a pressurised duct (a click every 5 ms, heard as hiss)
+    for (let c = 1; c <= MESH_L; c++) for (let r = 1; r <= MESH_H; r++) { const i = c * rows + r; if (!open[i] || was[i]) continue;
+      for (let d = 1; d < MESH_H; d++) { const u = i - d, w = i + d;
+        if (r - d >= 1 && was[u] && open[u]) { a[i] = a[u]; b[i] = b[u]; break; }
+        if (r + d <= MESH_H && was[w] && open[w]) { a[i] = a[w]; b[i] = b[w]; break; } } }
+    for (let i = 0; i < n; i++) { if (!open[i]) { if (was[i]) { a[i] = b[i] = 0; } continue; }
+      const c = (i / rows) | 0; list[nOpen] = i;
+      const q = [i - rows, i + rows, i - 1, i + 1];
+      for (let j = 0; j < 4; j++) { const t = q[j]; nb[nOpen * 4 + j] = (j === 1 && c === MESH_L) ? -2 : open[t] ? t : -1; }   // -1 wall (mirror), -2 beyond the lips (0)
+      nOpen++; } }
+  // ── the nose: a 1-D tube from the velum (8.8 cm up the tract) to the nostrils ──
+  const NL = 20, velCol = 16, na = new Float32Array(NL + 2), nbuf = new Float32Array(NL + 2), nc = new Float32Array(NL + 2);
+  let qa = na, qb = nbuf, qc = nc;
+  // ── source (as kRender, at the mesh rate) ──
+  const bright = cfg.brightness || 1, rough = cfg.roughness || 0, tilt = Math.min(0.85, Math.max(0, 0.45 - 0.35 * (bright - 1) + (natural ? 0.05 : 0)));
+  let seed = 12345; const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x3fffffff - 1; };
+  let phase = 0, T0 = MESH_SR / 115, oq = 0.6, amp = 1, lp = 0, lpPrev = 0, nlp = 0, nPrev = 0;
+  const spf = Math.round(MESH_SR * FRAME_MS / 1000), hi = new Float32Array(N * spf + Math.round(MESH_SR * 0.08));
+  for (let k = 0; k < N; k++) {
+    reshape(shapes[k]);
+    const k1 = Math.min(k + 1, N - 1), g0 = [], at = noiseAt[k];
+    for (let r = 1; r <= MESH_H; r++) if (open[1 * rows + r]) g0.push(1 * rows + r);
+    const nz = []; for (let r = 1; r <= MESH_H; r++) if (open[(at + 1) * rows + r]) nz.push((at + 1) * rows + r);
+    const vl = []; for (let r = 1; r <= MESH_H; r++) if (open[(velCol + 1) * rows + r]) vl.push((velCol + 1) * rows + r);
+    for (let s = 0; s < spf; s++) {
+      const x = s / spf, av = AV[k] + (AV[k1] - AV[k]) * x, ah = AH[k] + (AH[k1] - AH[k]) * x, af = AF[k] + (AF[k1] - AF[k]) * x, vel = VEL[k] + (VEL[k1] - VEL[k]) * x;
+      phase += 1;
+      if (phase >= T0) { phase -= T0; const f0 = F0[k] + (F0[k1] - F0[k]) * x;
+        T0 = MESH_SR / Math.max(50, f0 * (1 + (natural ? 0.008 : 0.002) * rnd() + rough * 0.04 * rnd()));
+        amp = 1 + (natural ? 0.04 : 0.01) * rnd() - rough * 0.25 * Math.abs(rnd()); oq = natural ? 0.57 : 0.52; }
+      const t = phase / (oq * T0), flow = t < 1 ? (t * t - t * t * t) * 6.75 : 0, noise = rnd();
+      let src = flow * av * amp + noise * ((natural ? 0.015 : 0) + rough * 0.15) * av * (t < 1 ? 1 : 0.15) * 0.6;
+      lp = (1 - tilt) * src + tilt * lp;
+      // mesh step
+      for (let m = 0; m < nOpen; m++) { const i = list[m], me = b[i]; let sum = 0;
+        for (let j = 0; j < 4; j++) { const t2 = nb[m * 4 + j]; sum += t2 >= 0 ? b[t2] : t2 === -1 ? me : 0; }
+        cN[i] = (0.5 * sum - (1 - beta) * a[i]) / (1 + beta); }
+      // the source goes in as the rate of change of glottal flow: flow itself would pile up as pressure behind a closed
+      // mouth (a stop, a nasal) and pop on release; its derivative has no DC, and the lips then need no extra difference
+      // aspiration (/h/, breath) is turbulence at the glottis: already a pressure-like source, so it goes in as is
+      if (g0.length) { const v = ((lp - lpPrev) * 6 + noise * ah * 0.075) / g0.length; for (const i of g0) cN[i] += v; }
+      nlp = 0.5 * (noise + nlp);                                                                             // frication: softened noise, just in front of the constriction
+      if (af > 0.005 && nz.length) { const v = nlp * af * 0.018 / nz.length; for (const i of nz) cN[i] += v; }
+      // nose: driven by the pressure at the velum, in proportion to how open it is
+      let pv = 0; for (const i of vl) pv += b[i]; pv = vl.length ? pv / vl.length : 0;
+      for (let j = 1; j <= NL; j++) { const w = qb[j - 1 > 0 ? j - 1 : 1], e = j < NL ? qb[j + 1] : 0;
+        qc[j] = (0.5 * (w + e + 2 * qb[j]) - (1 - beta) * qa[j]) / (1 + beta); }
+      qc[1] += pv * vel * 0.5;
+      let lipSum = 0; for (let r = 1; r <= MESH_H; r++) lipSum += cN[MESH_L * rows + r];
+      // the nose is fed by cavity pressure, not by the differentiated source, so it gets its own radiation difference
+      hi[k * spf + s] = lipSum + (qc[NL] - nPrev) * 6; nPrev = qc[NL]; lpPrev = lp;
+      let tmp = a; a = b; b = cN; cN = tmp; tmp = qa; qa = qb; qb = qc; qc = tmp;
+    } }
+  // ── down to 22,050 Hz: windowed-sinc low-pass (cutoff 9.5 kHz), then every fourth sample ──
+  const taps = 63, h = new Float32Array(taps), fc = 9500 / MESH_SR; let hs = 0;
+  for (let i = 0; i < taps; i++) { const m = i - (taps - 1) / 2; h[i] = (m === 0 ? 2 * fc : Math.sin(2 * Math.PI * fc * m) / (Math.PI * m)) * (0.54 - 0.46 * Math.cos(2 * Math.PI * i / (taps - 1))); hs += h[i]; }
+  const out = new Float32Array(Math.floor(hi.length / MESH_MULT));
+  for (let o = 0; o < out.length; o++) { const c = o * MESH_MULT; let s = 0; for (let i = 0; i < taps; i++) { const j = c + i - (taps >> 1); if (j >= 0 && j < hi.length) s += hi[j] * h[i]; } out[o] = s / hs; }
+  let peak = 1e-9; for (const v of out) peak = Math.max(peak, Math.abs(v));
+  const g = 0.89 / peak; for (let i = 0; i < out.length; i++) out[i] = Math.tanh(out[i] * g * 1.1) / Math.tanh(1.1);
+  const timeline = []; let prev = null;
+  frames.forEach((f, k) => { if (f.ph !== prev) { timeline.push({ t: k * FRAME_MS / 1000, phoneme: f.ph, pitch: F0[k], isVoiced: AV[k] > 0.2, isNoise: AF[k] > 0.1 || AH[k] > 0.1, area: Array.from(shapes[k]) }); prev = f.ph; } });
+  return { samples: out, sampleRate: sr, timeline };
+}
+// ==== END WEBSTER MESH CORE ====
+
+/**
+ * AUDIO ENGINE (PHYSICAL, v5): the mesh core, played through Web Audio. Same interface as the Formant engine.
+ */
+class MeshSynth extends KlattSynth {
+    render(phonemeSeq, config) { return mRender(phonemeSeq, config); }
+}
+
 
 const app = {
     synth: null,
@@ -2643,7 +2425,7 @@ const app = {
     init() {
         this.synth = new KlattSynth();
         this.retroSynth = new FormantSynth();
-        this.dwmSynth = new DWMSynth();
+        this.dwmSynth = new MeshSynth();
         
         const canvas = document.getElementById('visualizer');
         this.canvasCtx = canvas.getContext('2d');
@@ -2873,7 +2655,7 @@ const app = {
         document.getElementById('status-msg').textContent = 'Rendering WAV...';
         const phonemes = this.processText(rawText);
         const config = this.getConfig(rawText);
-        const eng = this.synthesisEngine === 'retro' ? this.retroSynth : this.synth;   // the Physical engine can't render offline yet
+        const eng = this.synthesisEngine === 'retro' ? this.retroSynth : this.synthesisEngine === 'dwm' ? this.dwmSynth : this.synth;
         const blob = await eng.renderToWAV(phonemes, config);
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -2946,10 +2728,17 @@ const app = {
             ctx.lineTo(width, height / 2);
             ctx.stroke();
             
-            if (activeSynth.isPlaying) {
-                 ctx.fillStyle = '#94a3b8';
-                 ctx.font = '14px monospace';
-                 ctx.fillText(`DWM Physical Engine Active`, 10, 30);
+            // the tract itself: the shape the mesh is using right now, glottis on the left, lips on the right
+            const q = activeSynth.visualQueue || [], now = activeSynth.ctx.currentTime;
+            let cur = null; for (const e of q) { if (e.time <= now) cur = e; else break; }
+            if (activeSynth.isPlaying && cur && cur.area) {
+                const A = cur.area, n = A.length, x0 = width * 0.12, w = width * 0.76, cy = height * 0.5, k = height * 0.055;
+                ctx.fillStyle = 'rgba(59,130,246,0.18)'; ctx.strokeStyle = '#94a3b8'; ctx.lineWidth = 1.5;
+                ctx.beginPath(); for (let i = 0; i < n; i++) ctx.lineTo(x0 + w * i / (n - 1), cy - A[i] * k);
+                for (let i = n - 1; i >= 0; i--) ctx.lineTo(x0 + w * i / (n - 1), cy + A[i] * k); ctx.closePath(); ctx.fill(); ctx.stroke();
+                ctx.fillStyle = '#94a3b8'; ctx.font = '12px monospace';
+                ctx.fillText('glottis', x0 - 10, cy + 6 * k + 18); ctx.fillText('lips', x0 + w - 18, cy + 6 * k + 18);
+                ctx.fillText(`Physical: waveguide mesh · /${cur.phoneme}/`, 10, 22);
             }
             return;
         }

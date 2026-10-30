@@ -11,7 +11,7 @@ Offline local formant speech synthesis.
 |---|---|
 | **Formant** (default, v4) | Klatt-style synthesis, the design behind MITalk and DECtalk. A glottal pulse runs through a cascade of five resonators (the vocal tract). Noise runs through parallel bands for hiss and stop bursts, with aspiration after p/t/k and nasal zeros for m/n/ŋ. Transitions between sounds are smoothed both ways in time, which is where coarticulation comes from. It renders samples directly, so what you hear is exactly what *Export WAV* saves. |
 | **Retro** | The original v3 engine: a sawtooth through three band filters. Buzzier and very 1980s. Kept on purpose. |
-| **Physical** | Experimental: a 2-D digital waveguide mesh of the vocal tract. |
+| **Physical** (v5, experimental) | A 2-D digital waveguide mesh of the vocal tract: a 17.6 cm grid of cells, its width at each point following the tract's shape, through which pressure waves actually travel. It is driven by the same plan, melody and glottal pulse as Formant, so only the tract differs. Vowel shapes are fitted against the mesh itself to the same formant targets (most within 0–6%); consonants close or narrow the tract at their place, with noise at the constriction and a nasal branch that opens for m/n/ŋ. It renders about twice as fast as real time. Known limit: front vowels come out low in F2 (/i/ about 20%), so they sound a bit lax. |
 
 ## Languages
 
@@ -34,7 +34,15 @@ The [Pip Suite](https://github.com/ConsciousNode/HTMLNLM) (Pip's Room, Multi-Pip
 
 `node tests/webster-vowels.js` renders steady vowels and measures their formants by LPC (needs python3 + numpy) against the Peterson & Barney targets the engine aims at. All six vowels land within 20%, most within 10%.
 
+`node tests/webster-mesh.js` (no dependencies) checks the Physical engine: a uniform tube rings at its quarter-wave modes (480/1440/2395 Hz, theory 480/1439/2399), the fitted vowels ring near their targets, and a whole sentence renders with no sound louder than twice the median vowel.
+
 ## Changelog
+
+### v5 — 2026-10-29 · Kham + Kehai Interim
+- **Physical engine rebuilt.** The v3 mesh never made a sound (its output tap at the lips was decoupled from the mesh, so it stayed at zero). It now speaks: a new mesh core at 88.2 kHz with a real 17.6 cm tract, vowel shapes fitted against the mesh, consonant closures and channels, frication and aspiration noise, a nasal branch, and levels balanced against Formant sound by sound.
+- The source goes in as the rate of change of glottal flow, so a closed mouth (a stop, a nasal) can't build up pressure and pop on release.
+- Physical now renders samples directly, so playback and *Export WAV* are the same audio, and the visualiser draws the tract shape for the current sound.
+- New test: `tests/webster-mesh.js`.
 
 ### v4.1 — 2026-10-27 · Kham + Kehai Interim
 - Less breathy in *Natural* mode (less noise mixed into the voice, a narrower glottal opening).
