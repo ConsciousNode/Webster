@@ -2663,8 +2663,8 @@ class MeshSynth extends KlattSynth {
           const v = (currentGlottal * 6 + currentAspiration) / sourceCells.length;
           for (const i of sourceCells) dst[i] += v;
         }
-        if (currentAF > 0.005 && fricCells.length) {
-          const v = currentNoise * currentAF * 0.018 / fricCells.length;
+        if (currentAF > 0.010 && fricCells.length) {
+          const v = currentNoise * currentAF * 0.019 / fricCells.length;
           for (const i of fricCells) dst[i] += v;
         }
         if (currentVelum > 0.005 && velumCells.length) {
